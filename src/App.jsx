@@ -1,12 +1,12 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { initializeApp } from "firebase/app";
+import { initializeApp, getApps, getApp } from "firebase/app";
 import {
   getAuth, GoogleAuthProvider, signInWithPopup, signInWithEmailAndPassword,
   signOut, onAuthStateChanged
 } from "firebase/auth";
 import {
-  getFirestore, doc, getDoc, setDoc, updateDoc, collection, getDocs,
-  query, orderBy, serverTimestamp
+  getFirestore, doc, getDoc, setDoc, collection, getDocs,
+  query, orderBy, serverTimestamp, writeBatch
 } from "firebase/firestore";
 
 /*
@@ -44,7 +44,7 @@ const firebaseReady = Object.values(firebaseConfig).every(
   (v) => v && !v.startsWith("PASTE_")
 );
 
-const app = firebaseReady ? initializeApp(firebaseConfig) : null;
+const app = firebaseReady ? (getApps().length ? getApp() : initializeApp(firebaseConfig)) : null;
 const auth = app ? getAuth(app) : null;
 const db = app ? getFirestore(app) : null;
 
@@ -1451,6 +1451,7 @@ function fmtDate(value) {
 
 export default function App() {
   const [user, setUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [profile, setProfile] = useState(null);
   const [screen, setScreen] = useState("home");
   const [activeTopic, setActiveTopic] = useState(null);
@@ -1460,30 +1461,70 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [adminRows, setAdminRows] = useState([]);
   const [filterSection, setFilterSection] = useState("ALL");
+  const [feedbackRating, setFeedbackRating] = useState(0);
+  const [feedbackCommentsSuggestions, setFeedbackCommentsSuggestions] = useState("");
+  const [topicStartedAt, setTopicStartedAt] = useState(null);
+  const [selectedStudent, setSelectedStudent] = useState(null);
+  const [selectedStudentAttempts, setSelectedStudentAttempts] = useState([]);
+  const [loadingStudentDetails, setLoadingStudentDetails] = useState(false);
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState(false);
   const [profileForm, setProfileForm] = useState({ firstName: "", lastName: "", section: "IT201A", avatar: AVATARS[0] });
 
   useEffect(() => {
-    if (!auth) return;
-    return onAuthStateChanged(auth, async (current) => {
+    if (!auth) {
+      setAuthLoading(false);
+      return undefined;
+    }
+
+    let active = true;
+    const unsubscribe = onAuthStateChanged(auth, async (current) => {
+      if (!active) return;
       setUser(current);
       setProfile(null);
-      if (!current) { setScreen("home"); return; }
+      setNotice("");
+
+      if (!current) {
+        setScreen("home");
+        setAuthLoading(false);
+        return;
+      }
+
       try {
         const snap = await getDoc(doc(db, "users", current.uid));
+        if (!active) return;
+
         if (snap.exists()) {
           const data = snap.data();
           setProfile(data);
           setProfileForm({
-            firstName: data.firstName || "", lastName: data.lastName || "",
-            section: data.section || "IT201A", avatar: data.avatar || AVATARS[0]
+            firstName: data.firstName || "",
+            lastName: data.lastName || "",
+            section: data.section || "IT201A",
+            avatar: data.avatar || AVATARS[0]
           });
           setScreen(data.role === "admin" ? "admin" : data.profileComplete ? "home" : "profile");
         } else {
           setScreen("profile");
-          setProfileForm((p) => ({ ...p, firstName: current.displayName?.split(" ")[0] || "", lastName: current.displayName?.split(" ").slice(1).join(" ") || "" }));
+          setProfileForm((p) => ({
+            ...p,
+            firstName: current.displayName?.split(" ")[0] || "",
+            lastName: current.displayName?.split(" ").slice(1).join(" ") || ""
+          }));
         }
-      } catch (e) { setNotice(e.message); }
+      } catch (e) {
+        if (active) {
+          setNotice("Signed in, but your student profile could not be loaded. Check your Firestore rules and connection. " + e.message);
+          setScreen("home");
+        }
+      } finally {
+        if (active) setAuthLoading(false);
+      }
     });
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   const isAdmin = profile?.role === "admin";
@@ -1532,31 +1573,86 @@ export default function App() {
   }
 
   function openTopic(topic) {
-    setActiveTopic(topic); setAnswers({}); setSubmitted(false); setScreen("lesson");
+    setActiveTopic(topic); setAnswers({}); setSubmitted(false); setTopicStartedAt(Date.now()); setScreen("lesson");
   }
 
   async function submitTopic() {
     if (!user || !db || !activeTopic) return;
+    const submittedAtClient = new Date();
+    const startedAtClient = topicStartedAt || Date.now();
+    const durationSeconds = Math.max(0, Math.round((Date.now() - startedAtClient) / 1000));
     const score = activeTopic.questions.reduce((n, q, i) => n + (answers[i] === q.correct ? 1 : 0), 0);
-    const points = score * 10 + (score === activeTopic.questions.length ? 10 : 0);
+    const totalQuestions = activeTopic.questions.length;
+    const points = score * 10 + (score === totalQuestions ? 10 : 0);
     const previous = progressData[activeTopic.id] || {};
     const progress = {
       ...progressData,
       [activeTopic.id]: {
-        completed: true, score, totalQuestions: activeTopic.questions.length,
+        completed: true, score, totalQuestions,
         points: Math.max(previous.points || 0, points),
         attempts: (previous.attempts || 0) + 1,
-        lastAttemptAt: new Date().toISOString(),
-        completedAt: new Date().toISOString()
+        lastAttemptAt: submittedAtClient.toISOString(),
+        lastStartedAt: new Date(startedAtClient).toISOString(),
+        lastDurationSeconds: durationSeconds,
+        completedAt: submittedAtClient.toISOString()
       }
     };
     setBusy(true); setNotice("");
     try {
-      await updateDoc(doc(db, "users", user.uid), { progress, updatedAt: serverTimestamp() });
+      // Save the attempt and the student's summary in one atomic operation.
+      // If either write is denied, neither write is committed.
+      const attemptRef = doc(collection(db, "users", user.uid, "topicAttempts"));
+      const studentRef = doc(db, "users", user.uid);
+      const batch = writeBatch(db);
+      batch.set(attemptRef, {
+        topicId: activeTopic.id,
+        topicTitle: activeTopic.title,
+        startedAt: new Date(startedAtClient).toISOString(),
+        submittedAt: serverTimestamp(),
+        submittedAtClient: submittedAtClient.toISOString(),
+        durationSeconds,
+        score,
+        totalQuestions,
+        answers: activeTopic.questions.map((q, i) => ({
+          question: q.q,
+          selectedAnswer: answers[i] == null ? null : q.a[answers[i]],
+          selectedIndex: answers[i] == null ? null : answers[i],
+          correctAnswer: q.a[q.correct],
+          correctIndex: q.correct,
+          isCorrect: answers[i] === q.correct
+        }))
+      });
+      batch.set(studentRef, { progress, updatedAt: serverTimestamp() }, { merge: true });
+      await batch.commit();
       setProfile(p => ({ ...p, progress }));
       setSubmitted(true);
-    } catch (e) { setNotice("Could not save progress: " + e.message); }
+    } catch (e) { setNotice("Could not save progress and attempt details: " + e.message); }
     finally { setBusy(false); }
+  }
+
+  async function submitCourseFeedback(e) {
+    e.preventDefault();
+    if (!user || !db) return;
+    if (!feedbackRating) return setNotice("Please select a rating from 1 to 5.");
+    if (!feedbackCommentsSuggestions.trim()) {
+      return setNotice("Please enter your comments and suggestions.");
+    }
+    setBusy(true); setNotice("");
+    try {
+      const feedback = {
+        rating: feedbackRating,
+        ratingLabel: ["", "Needs Improvement", "Fair", "Good", "Very Good", "Excellent"][feedbackRating],
+        commentsSuggestions: feedbackCommentsSuggestions.trim(),
+        submittedAt: serverTimestamp(),
+        submittedAtClient: new Date().toISOString()
+      };
+      await setDoc(doc(db, "users", user.uid), { courseFeedback: feedback, updatedAt: serverTimestamp() }, { merge: true });
+      setProfile(p => ({ ...p, courseFeedback: { ...feedback, submittedAt: new Date() } }));
+      setFeedbackSubmitted(true);
+      setNotice("Thank you! Your feedback has been submitted.");
+    } catch (err) {
+      setNotice("Could not submit feedback: " + err.message);
+    } finally { setBusy(false); }
   }
 
   async function loadAdminRows() {
@@ -1569,6 +1665,19 @@ export default function App() {
     finally { setBusy(false); }
   }
 
+  async function viewStudentProgress(student) {
+    setSelectedStudent(student);
+    setSelectedStudentAttempts([]);
+    setLoadingStudentDetails(true);
+    setNotice("");
+    try {
+      const snap = await getDocs(query(collection(db, "users", student.id, "topicAttempts"), orderBy("submittedAt", "desc")));
+      setSelectedStudentAttempts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    } catch (e) {
+      setNotice("Could not load detailed attempts. Check the topicAttempts Firestore rules: " + e.message);
+    } finally { setLoadingStudentDetails(false); }
+  }
+
   useEffect(() => { if (screen === "admin" && isAdmin) loadAdminRows(); }, [screen, isAdmin]);
 
   async function logout() {
@@ -1577,6 +1686,13 @@ export default function App() {
   }
 
   const visibleRows = useMemo(() => adminRows.filter(r => filterSection === "ALL" || r.section === filterSection), [adminRows, filterSection]);
+
+  if (authLoading) {
+    return <div className="authWrap"><style>{styles}</style><div className="panel authCard" style={{textAlign:"center"}}>
+      <div className="brand" style={{justifyContent:"center"}}><span className="brandmark">⚔️</span> DSA QUEST</div>
+      <p className="muted" style={{marginTop:22}}>Connecting securely…</p>
+    </div></div>;
+  }
 
   if (!firebaseReady) {
     return <div className="authWrap"><style>{styles}</style><div className="panel authCard">
@@ -1624,14 +1740,23 @@ export default function App() {
     <div className="between"><div><p className="eyebrow">Control center</p><h1 style={{fontSize:38}}>Student progress</h1><p className="muted">Monitor profiles, completed topics, quiz scores and recorded timestamps.</p></div><button className="btn secondary" onClick={loadAdminRows}>↻ Refresh data</button></div>
     <div className="heroStats" style={{margin:"20px 0"}}><div className="stat"><span className="muted small">REGISTERED STUDENTS</span><strong>{adminRows.length}</strong></div><div className="stat"><span className="muted small">SECTIONS</span><strong>{new Set(adminRows.map(r=>r.section).filter(Boolean)).size}</strong></div></div>
     <div className="panel"><div className="between"><h2>Student records</h2><select className="select" style={{maxWidth:160}} value={filterSection} onChange={e=>setFilterSection(e.target.value)}><option value="ALL">All sections</option>{SECTIONS.map(s=><option key={s}>{s}</option>)}</select></div>
-      <div className="tableWrap"><table><thead><tr><th>Student</th><th>Section</th><th>Topics</th><th>XP</th><th>Last activity</th><th>Email</th></tr></thead><tbody>
-      {visibleRows.map(r=>{const prog=r.progress||{};const done=TOPICS.filter(t=>prog[t.id]?.completed).length;const xp=Object.values(prog).reduce((n,v)=>n+(v.points||0),0);const last=Object.values(prog).map(v=>v.lastAttemptAt).filter(Boolean).sort().at(-1);return <tr key={r.id}><td>{r.avatar||"👤"} <b>{r.lastName}, {r.firstName}</b></td><td>{r.section||"—"}</td><td>{done}/{TOPICS.length}</td><td>{xp}</td><td>{fmtDate(last)}</td><td>{r.email||"—"}</td></tr>})}
-      {visibleRows.length===0&&<tr><td colSpan="6" className="muted">No student records found.</td></tr>}</tbody></table></div>
+      <div className="tableWrap"><table><thead><tr><th>Student</th><th>Section</th><th>Topics</th><th>XP</th><th>Last activity</th><th>Email</th><th>Details</th></tr></thead><tbody>
+      {visibleRows.map(r=>{const prog=r.progress||{};const done=TOPICS.filter(t=>prog[t.id]?.completed).length;const xp=Object.values(prog).reduce((n,v)=>n+(v.points||0),0);const last=Object.values(prog).map(v=>v.lastAttemptAt).filter(Boolean).sort().at(-1);return <tr key={r.id}><td>{r.avatar||"👤"} <b>{r.lastName}, {r.firstName}</b></td><td>{r.section||"—"}</td><td>{done}/{TOPICS.length}</td><td>{xp}</td><td>{fmtDate(last)}</td><td>{r.email||"—"}</td><td><button className="btn secondary" style={{padding:"8px 11px",fontSize:12}} onClick={()=>viewStudentProgress(r)}>View progress</button></td></tr>})}
+      {visibleRows.length===0&&<tr><td colSpan="7" className="muted">No student records found.</td></tr>}</tbody></table></div>
     </div>
+    {selectedStudent && <section className="panel" style={{marginTop:18}}>
+      <div className="between"><div><p className="eyebrow">Individual learning record</p><h2 style={{margin:"4px 0"}}>{selectedStudent.avatar||"👤"} {selectedStudent.lastName}, {selectedStudent.firstName}</h2><p className="muted small">{selectedStudent.section||"—"} · {selectedStudent.email||"No email"}</p></div><button className="btn ghost" onClick={()=>{setSelectedStudent(null);setSelectedStudentAttempts([])}}>Close details</button></div>
+      {loadingStudentDetails ? <p className="muted">Loading topic attempts…</p> : selectedStudentAttempts.length ? selectedStudentAttempts.map(a=><article key={a.id} className="question">
+        <div className="between"><h3 style={{margin:0}}>{a.topicTitle||a.topicId}</h3><span className="pill">Score: {a.score}/{a.totalQuestions||10}</span></div>
+        <div className="row" style={{marginTop:10}}><span className="small muted">Started: {fmtDate(a.startedAt)}</span><span className="small muted">Submitted: {fmtDate(a.submittedAtClient||a.submittedAt)}</span><span className="small muted">Duration: {Math.floor((a.durationSeconds||0)/60)}m {(a.durationSeconds||0)%60}s</span></div>
+        <p className="small muted" style={{marginTop:10}}>Answer details ({(a.answers||[]).filter(x=>x.isCorrect).length}/{a.totalQuestions||10} correct)</p>
+        {(a.answers||[]).map((ans,i)=><div key={i} style={{padding:"9px 0",borderTop:"1px solid #293a58"}}><b className="small">{i+1}. {ans.question}</b><p className="small" style={{margin:"4px 0",color:ans.isCorrect?"#86efac":"#fca5a5"}}>Student answer: {ans.selectedAnswer ?? "No answer"} · {ans.isCorrect?"Correct":"Incorrect"}</p>{!ans.isCorrect&&<p className="small muted" style={{margin:0}}>Correct answer: {ans.correctAnswer}</p>}</div>)}
+      </article>) : <p className="muted">No detailed topic attempts have been recorded yet. Attempts submitted before this update only have summary scores.</p>}
+      {selectedStudent.courseFeedback && <div className="question"><h3>Course feedback · {selectedStudent.courseFeedback.rating}/5 ({selectedStudent.courseFeedback.ratingLabel})</h3><p className="small">{selectedStudent.courseFeedback.commentsSuggestions||[selectedStudent.courseFeedback.comments,selectedStudent.courseFeedback.suggestions].filter(Boolean).join("\n\n")||"No written feedback."}</p></div>}
+    </section>}
     {notice&&<p className="notice" style={{marginTop:12}}>{notice}</p>}
   </div></div>;
 
-  if (isAdmin && screen !== "admin") setScreen("admin");
 
   if (screen === "lesson" && activeTopic) {
     const score = activeTopic.questions.reduce((n,q,i)=>n+(answers[i]===q.correct?1:0),0);
@@ -1641,7 +1766,7 @@ export default function App() {
       <div className="two" style={{marginTop:18}}><div className="panel"><h2>📖 Concept briefing</h2><p>{activeTopic.intro}</p><h3>Key facts</h3><ul className="muted">{activeTopic.facts.map(f=><li key={f} style={{marginBottom:9}}>{f}</li>)}</ul><h3>Java code example</h3><pre className="code">{activeTopic.java}</pre></div>
       <div className="panel"><h2>🎯 Knowledge challenge</h2><p className="muted small">Answer all 10 questions. Questions 1–5 focus on identification and concepts; Questions 6–10 require Java output tracing. Each correct answer earns 10 XP; a perfect score earns a 10 XP bonus. Correct answers and explanations appear only after you submit.</p>
         {activeTopic.questions.map((q,i)=><div className="question" key={i}><div className="between"><span className="pill">{i < 5 ? "IDENTIFICATION / CONCEPT" : "OUTPUT TRACING"}</span><span className="small muted">Question {i+1} of 10</span></div><b style={{display:"block",marginTop:10}}>{i+1}. {q.q}</b><div className="answers">{q.a.map((a,j)=><button key={j} disabled={submitted} className={"answer "+(answers[i]===j?"selected ":"")+(submitted&&j===q.correct?"correct":"")+(submitted&&answers[i]===j&&j!==q.correct?"wrong":"")} onClick={()=>setAnswers({...answers,[i]:j})}>{String.fromCharCode(65+j)}. {a}</button>)}</div>{submitted&&<div className="notice success" style={{marginTop:10}}><b>Correct answer: {String.fromCharCode(65+q.correct)}. {q.a[q.correct]}</b><p className="small" style={{margin:"6px 0 0"}}>{q.why}</p></div>}</div>)}
-        {!submitted?<button className="btn full" disabled={busy||Object.keys(answers).length!==activeTopic.questions.length} onClick={submitTopic}>Submit challenge · {score}/{activeTopic.questions.length}</button>:<><div className="notice success">Challenge submitted! You scored {score}/{activeTopic.questions.length} · +{score*10+(score===activeTopic.questions.length?10:0)} XP. Correct answers and explanations are now displayed above.</div><button className="btn full" style={{marginTop:12}} onClick={()=>setScreen("home")}>Return to dashboard</button></>}
+        {!submitted?<button className="btn full" disabled={busy||Object.keys(answers).length!==activeTopic.questions.length} onClick={submitTopic}>Submit challenge</button>:<><div className="notice success">Challenge submitted! You scored {score}/{activeTopic.questions.length} · +{score*10+(score===activeTopic.questions.length?10:0)} XP. Correct answers and explanations are now displayed above.</div><button className="btn full" style={{marginTop:12}} onClick={()=>setScreen("home")}>Return to dashboard</button></>}
       </div></div>
       {notice&&<p className="notice" style={{marginTop:12}}>{notice}</p>}
     </div></div>;
@@ -1653,7 +1778,7 @@ export default function App() {
       <div className="heroStats"><div className="stat"><span className="muted small">TOPICS COMPLETED</span><strong>{completedCount}<span className="muted" style={{fontSize:15}}> / {TOPICS.length}</span></strong><div className="progress"><span style={{width:overallPercent+"%"}}/></div></div><div className="stat"><span className="muted small">TOTAL XP</span><strong>{totalPoints}</strong></div><div className="stat"><span className="muted small">COMPLETION</span><strong>{overallPercent}%</strong></div><div className="stat"><span className="muted small">PLAYER LEVEL</span><strong>{Math.floor(totalPoints/50)+1}</strong></div></div>
     </section>
     <div className="between" style={{margin:"30px 0 15px"}}><div><p className="eyebrow">Learning path</p><h2 style={{margin:0}}>Your DSA missions</h2></div><span className="muted small">10 modules · 100 questions · Java examples</span></div>
-    <div className="grid">{TOPICS.map((t,i)=>{const p=progressData[t.id];return <button className="topic" key={t.id} onClick={()=>openTopic(t)} style={{borderTop:"3px solid "+t.color}}><div className="between"><span className="ico">{t.icon}</span><span className="pill">{p?.completed?"✓ COMPLETED":`MISSION ${String(i+1).padStart(2,"0")}`}</span></div><h3>{t.title}</h3><p>{t.intro}</p><div style={{marginTop:14}} className="between"><span className="small muted">{p?`Best: ${p.score}/${p.totalQuestions}`:"Not started"}</span><span className="small" style={{color:t.color,fontWeight:800}}>Open mission →</span></div></button>})}</div>
+    <div className="grid">{TOPICS.map((t,i)=>{const p=progressData[t.id];return <React.Fragment key={t.id}><button className="topic" onClick={()=>openTopic(t)} style={{borderTop:"3px solid "+t.color}}><div className="between"><span className="ico">{t.icon}</span><span className="pill">{p?.completed?"✓ COMPLETED":`MISSION ${String(i+1).padStart(2,"0")}`}</span></div><h3>{t.title}</h3><p>{t.intro}</p><div style={{marginTop:14}} className="between"><span className="small muted">{p?`Best: ${p.score}/${p.totalQuestions}`:"Not started"}</span><span className="small" style={{color:t.color,fontWeight:800}}>Open mission →</span></div></button>{t.id === "oop" && <section className="panel" style={{borderTop:"3px solid #a78bfa",minHeight:172}}><p className="eyebrow">Course feedback</p><h3 style={{margin:"4px 0 8px"}}>⭐ Rate Sir Khai</h3>{profile?.courseFeedback?.rating && <p className="small" style={{color:"#86efac"}}>Previously submitted: {profile.courseFeedback.rating}/5</p>}{feedbackSubmitted || profile?.courseFeedback?.rating ? <p className="muted small">Thank you for sharing your feedback. Your response has been saved.</p> : <form onSubmit={submitCourseFeedback}><p className="muted small">Please rate the learning experience from 1 (Needs Improvement) to 5 (Excellent).</p><div className="row" style={{gap:7,margin:"12px 0"}}>{[1,2,3,4,5].map(n=><button type="button" key={n} className="avatar" aria-label={`Rate ${n}`} onClick={()=>setFeedbackRating(n)} style={{borderColor:feedbackRating===n?"#a78bfa":"#344665",background:feedbackRating===n?"#30235a":"#0b1324",width:42,height:42}}><span style={{fontSize:18,fontWeight:900}}>{n}</span> <span aria-hidden="true">★</span></button>)}</div><p className="small muted">{feedbackRating ? ["","Needs Improvement","Fair","Good","Very Good","Excellent"][feedbackRating] : "Select your rating"}</p><div className="field"><label>Comments and suggestions</label><textarea className="input" rows="3" value={feedbackCommentsSuggestions} onChange={e=>setFeedbackCommentsSuggestions(e.target.value)} placeholder="Share your comments and suggestions for improvement..." required /></div><button className="btn full" type="submit" disabled={busy || !feedbackRating}>{busy?"Submitting...":"Submit feedback"}</button></form>}</section>}</React.Fragment>})}</div>
     <div className="panel" style={{marginTop:20}}><div className="between"><div><p className="eyebrow">Saved learning record</p><h3 style={{margin:"4px 0"}}>Progress is synced to your account</h3><p className="muted small" style={{margin:0}}>Each submitted challenge stores a completion timestamp, attempt count and score.</p></div><span className="pill">☁️ FIRESTORE SYNC</span></div></div>
     {notice&&<p className="notice" style={{marginTop:12}}>{notice}</p>}
   </div></div>;
